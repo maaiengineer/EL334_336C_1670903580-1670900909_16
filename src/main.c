@@ -8,18 +8,19 @@
  *---------------------------------------------------------------------------
  *  SYSTEM OVERVIEW
  *---------------------------------------------------------------------------
- *  A five-state home security controller.
+ *  A six-state home security controller.
  *
  *      DISARMED --[S1]--> ARMING --[10 s]--> ARMED
  *          ^                                   |
  *          |                         [PIR motion detected]
  *          |                                   v
- *          +---[correct code]--- ALARM <--[15 s]-- TRIGGERED
- *                                  ^                  |
- *                                  +------------------+
+ *       UNLOCK <--[correct code]-- ALARM <--[15 s]-- TRIGGERED
+ *          ^                         ^                  |
+ *          +--[correct code]---------+------------------+
  *
  *  While in TRIGGERED or ALARM the user disarms the system by entering a
- *  four-key secret code on S1/S2/S3.
+ *  four-key secret code on S1/S2/S3. UNLOCK shows the confirmation for
+ *  1.5 s and then returns to DISARMED.
  *
  *---------------------------------------------------------------------------
  *  REQUIRED FEATURES (per assignment)
@@ -27,7 +28,8 @@
  *  Timer / Counter : PIT channel 0  - 2 ms  7-segment multiplex refresh
  *                    PIT channel 1  - 1 ms  system tick + switch debounce
  *                    FTM0 channel 6 - PWM tone generation for the buzzer
- *  Interrupt       : PORTB vector   - S1, S2, S3 and the PIR sensor
+ *  Interrupt       : PORTB vector   - S1, S2, S3
+ *                    PORTC vector   - PIR sensor
  *                    PIT0 / PIT1 vectors
  *  Modular code    : every device has its own group of helper functions.
  *                    main() only initialises and dispatches.
@@ -48,7 +50,7 @@
  *  7-seg CLK           D7        PTC3      74HC595 SFTCLK
  *  7-seg DATA          D8        PTC12     74HC595 SDI
  *  PIR HC-SR501 OUT    D6        PTC2      rising-edge interrupt
- *  LCD I2C SDA/SCL     D14/D15   PTE25/24  optional
+ *  LCD I2C (PCF8574)   D0/D1     PTC16/17  software I2C, APC220 header
  *
  *---------------------------------------------------------------------------
  *  HARDWARE NOTES  (found during bring-up, see the report)
@@ -67,6 +69,15 @@
  *     signal. Rows, top to bottom: D5, D6, D9, A5. The PIR's OUT goes to the
  *     signal pin of the D6 row. D5 is avoided because PTA2 is the JTAG/SWO
  *     trace pin, and A5 is left free for an analog sensor.
+ *  5. The shield covers D14/D15, so the I2C LCD is plugged into the shield's
+ *     APC220 header instead: pin 1 GND, pin 2 +5 V, pin 4 D1, pin 5 D0.
+ *     D0/D1 = PTC16/PTC17 have no hardware I2C function, so the LCD module
+ *     drives the bus in software. A line is never driven HIGH: a "1" turns
+ *     the pin into an input and the backpack's own pull-up raises it. PTC16
+ *     and PTC17 are digital-only pins rated to 5.5 V (K64 data sheet, VDIO).
+ *     The SDA/SCL order and the backpack address are detected at start-up
+ *     and shown on the 7-segment display for 1.5 s:
+ *     "L 27" or "L 3F" = address that answered, "L --" = no LCD found.
  *
  *  Comments are written in English on purpose: the Keil editor defaults to
  *  ANSI encoding and corrupts UTF-8 Thai text when it saves the file.
@@ -83,9 +94,10 @@
  * 1 = real HC-SR501 on the shield's D6 header, signal reaching PTC2        */
 #define PIR_USE_HARDWARE    1
 
-/* 0 = no LCD fitted yet (calls become no-ops)
- * 1 = I2C character LCD on D14/D15                                         */
-#define USE_LCD             0
+/* 0 = no LCD fitted (calls become no-ops)
+ * 1 = 16x2 I2C LCD (PCF8574 backpack) on the shield's APC220 header,
+ *     software I2C on D0 = PTC16 and D1 = PTC17 (hardware note 5)          */
+#define USE_LCD             1
 
 /* Bus clock. system_MK64F12.c uses CLOCK_SETUP 0 (FEI mode).
  * Calibrated by timing the Stage-5 second counter against a stopwatch.
@@ -113,6 +125,9 @@
 #define LATCH_PIN   23u         /* PTB23 */
 #define CLK_PIN     3u          /* PTC3  */
 #define DATA_PIN    12u         /* PTC12 */
+
+#define LCD_PIN_A   16u         /* PTC16 = D0, APC220 header pin 5 */
+#define LCD_PIN_B   17u         /* PTC17 = D1, APC220 header pin 4 */
 
 /*===========================================================================
  *  3. APPLICATION PARAMETERS
@@ -435,7 +450,7 @@ static uint8_t Button_GetEvent(void)
 }
 
 /*===========================================================================
- * 10. PIR MODULE                                      (HC-SR501 on PTB9)
+ * 10. PIR MODULE                                      (HC-SR501 on PTC2)
  *===========================================================================*/
 static void PIR_Init(void)
 {
@@ -459,24 +474,264 @@ static uint8_t PIR_GetEvent(void)
 }
 
 /*===========================================================================
- * 11. LCD MODULE                                      (placeholder for now)
- *  Filled in once the I2C character LCD arrives. Until then every call is a
- *  no-op so the rest of the program is unaffected.
+ * 11. LCD MODULE              (16x2 HD44780 LCD behind a PCF8574 I2C backpack)
+ *  The I2C bus is driven in software on PTC16/PTC17 (hardware note 5).
+ *  Open-drain emulation:  LOW  = pin is an output driving 0
+ *                         HIGH = pin is an input, the backpack pull-up
+ *                                raises the line
+ *  PCF8574 port bits: P0 = RS, P1 = RW, P2 = EN, P3 = backlight,
+ *                     P4..P7 = LCD D4..D7 (the LCD runs in 4-bit mode).
+ *  With USE_LCD = 0 every call is a no-op.
  *===========================================================================*/
+#if (USE_LCD == 1)
+
+#define LCD_RS          0x01u
+#define LCD_EN          0x04u
+#define LCD_BL          0x08u
+#define LCD_COLS        16u
+#define SWI2C_HALF_US   10u         /* half a clock period, bus stays < 50 kHz */
+
+static uint32_t g_i2c_sda  = (1u << LCD_PIN_A);
+static uint32_t g_i2c_scl  = (1u << LCD_PIN_B);
+static uint8_t  g_lcd_addr = 0u;    /* 7-bit address, 0 = no LCD answered */
+
+/* Busy wait of at least 'us' microseconds. One pass of the loop takes at
+ * least 3 core cycles, and the core runs at the bus clock in CLOCK_SETUP 0,
+ * so the real delay is never shorter than asked (usually 1.5-2x longer). */
+static void LCD_DelayUs(uint32_t us)
+{
+    volatile uint32_t n = us * ((BUS_CLK_HZ / 3000000u) + 1u);
+    while (n != 0u) { n--; }
+}
+
+static void LCD_DelayMs(uint32_t ms)
+{
+    while (ms != 0u) {
+        LCD_DelayUs(1000u);
+        ms--;
+    }
+}
+
+/*--- bit-banged I2C master ------------------------------------------------*/
+static void SWI2C_SdaLow(void)  { PTC->PDDR |=  g_i2c_sda; }
+static void SWI2C_SdaHigh(void) { PTC->PDDR &= ~g_i2c_sda; }
+static void SWI2C_SclLow(void)  { PTC->PDDR |=  g_i2c_scl; }
+
+/* Release SCL, then wait (with a time-out) until the line is really high. */
+static void SWI2C_SclHigh(void)
+{
+    uint32_t guard = 1000u;
+
+    PTC->PDDR &= ~g_i2c_scl;
+    while (((PTC->PDIR & g_i2c_scl) == 0u) && (guard != 0u)) {
+        guard--;
+    }
+}
+
+/* START: SDA falls while SCL is high. */
+static void SWI2C_Start(void)
+{
+    SWI2C_SdaHigh();
+    SWI2C_SclHigh();    LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_SdaLow();     LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_SclLow();     LCD_DelayUs(SWI2C_HALF_US);
+}
+
+/* STOP: SDA rises while SCL is high. Expects SCL low on entry. */
+static void SWI2C_Stop(void)
+{
+    SWI2C_SdaLow();     LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_SclHigh();    LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_SdaHigh();    LCD_DelayUs(SWI2C_HALF_US);
+}
+
+/* Send one byte, MSB first. Returns 1 if the slave answered with ACK. */
+static uint8_t SWI2C_WriteByte(uint8_t b)
+{
+    uint8_t i;
+    uint8_t ack;
+
+    for (i = 0u; i < 8u; i++) {
+        if (b & 0x80u) SWI2C_SdaHigh(); else SWI2C_SdaLow();
+        b = (uint8_t)(b << 1);
+        LCD_DelayUs(SWI2C_HALF_US);
+        SWI2C_SclHigh();    LCD_DelayUs(SWI2C_HALF_US);
+        SWI2C_SclLow();
+    }
+
+    SWI2C_SdaHigh();                            /* let the slave drive SDA */
+    LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_SclHigh();    LCD_DelayUs(SWI2C_HALF_US);
+    ack = (uint8_t)(((PTC->PDIR & g_i2c_sda) == 0u) ? 1u : 0u);
+    SWI2C_SclLow();     LCD_DelayUs(SWI2C_HALF_US);
+    return ack;
+}
+
+/* Free a slave left halfway through a byte: 9 clocks with SDA released,
+ * then a STOP. */
+static void SWI2C_Recover(void)
+{
+    uint8_t i;
+
+    SWI2C_SdaHigh();
+    for (i = 0u; i < 9u; i++) {
+        SWI2C_SclLow();     LCD_DelayUs(SWI2C_HALF_US);
+        SWI2C_SclHigh();    LCD_DelayUs(SWI2C_HALF_US);
+    }
+    SWI2C_SclLow();     LCD_DelayUs(SWI2C_HALF_US);
+    SWI2C_Stop();
+}
+
+/* Returns 1 if a device answers at this 7-bit address. */
+static uint8_t SWI2C_Probe(uint8_t addr)
+{
+    uint8_t ack;
+
+    SWI2C_Start();
+    ack = SWI2C_WriteByte((uint8_t)(addr << 1));    /* R/W bit = 0, write */
+    SWI2C_Stop();
+    return ack;
+}
+
+/*--- PCF8574 -> HD44780 ---------------------------------------------------*/
+
+/* Put one nibble on D4..D7 and pulse EN. Must be called inside an open I2C
+ * transfer. Each PCF8574 byte takes well over 0.1 ms on this slow bus, so
+ * the EN pulse width and the 37 us HD44780 execution time are both met. */
+static void LCD_PutNibble(uint8_t nibble, uint8_t rs)
+{
+    uint8_t out = (uint8_t)((uint8_t)(nibble << 4) | LCD_BL | rs);
+
+    (void)SWI2C_WriteByte((uint8_t)(out | LCD_EN));
+    (void)SWI2C_WriteByte(out);                 /* EN falls: LCD latches */
+}
+
+static void LCD_PutByte(uint8_t b, uint8_t rs)
+{
+    LCD_PutNibble((uint8_t)(b >> 4), rs);
+    LCD_PutNibble((uint8_t)(b & 0x0Fu), rs);
+}
+
+/* Start-up only: a single nibble as its own I2C transfer. */
+static void LCD_InitNibble(uint8_t nibble)
+{
+    SWI2C_Start();
+    (void)SWI2C_WriteByte((uint8_t)(g_lcd_addr << 1));
+    LCD_PutNibble(nibble, 0u);
+    SWI2C_Stop();
+}
+
+/* One command byte as its own I2C transfer. */
+static void LCD_Command(uint8_t cmd)
+{
+    SWI2C_Start();
+    (void)SWI2C_WriteByte((uint8_t)(g_lcd_addr << 1));
+    LCD_PutByte(cmd, 0u);
+    SWI2C_Stop();
+}
+
+/* Try both SDA/SCL orders and every PCF8574 (0x20-0x27) and PCF8574A
+ * (0x38-0x3F) address. Returns the address that answered and leaves the
+ * working pin order selected, or returns 0 if nothing answered. */
+static uint8_t LCD_Detect(void)
+{
+    uint8_t order;
+    uint8_t addr;
+
+    for (order = 0u; order < 2u; order++) {
+        g_i2c_sda = (order == 0u) ? (1u << LCD_PIN_A) : (1u << LCD_PIN_B);
+        g_i2c_scl = (order == 0u) ? (1u << LCD_PIN_B) : (1u << LCD_PIN_A);
+        SWI2C_Recover();
+
+        for (addr = 0x20u; addr <= 0x3Fu; addr++) {
+            if (addr == 0x28u) addr = 0x38u;    /* skip the unused gap */
+            if (SWI2C_Probe(addr)) return addr;
+        }
+    }
+    return 0u;
+}
+
+/* Rewrite one whole row, padded with spaces, in a single I2C transfer. */
+static void LCD_WriteLine(uint8_t ddram_cmd, const char *s)
+{
+    uint8_t col;
+
+    SWI2C_Start();
+    (void)SWI2C_WriteByte((uint8_t)(g_lcd_addr << 1));
+    LCD_PutByte(ddram_cmd, 0u);                 /* cursor to start of row */
+    for (col = 0u; col < LCD_COLS; col++) {
+        if (*s != '\0') {
+            LCD_PutByte((uint8_t)*s, LCD_RS);
+            s++;
+        } else {
+            LCD_PutByte((uint8_t)' ', LCD_RS);
+        }
+    }
+    SWI2C_Stop();
+}
+
+#endif /* USE_LCD */
+
 static void LCD_Init(void)
 {
 #if (USE_LCD == 1)
-    /* TODO: I2C0 init on PTE24/PTE25, then the HD44780 4-bit init sequence */
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK;
+    PORTC->PCR[LCD_PIN_A] = PORT_PCR_MUX(1);    /* GPIO, no internal pull */
+    PORTC->PCR[LCD_PIN_B] = PORT_PCR_MUX(1);
+    PTC->PCOR  =  (1u << LCD_PIN_A) | (1u << LCD_PIN_B);  /* output level 0 */
+    PTC->PDDR &= ~((1u << LCD_PIN_A) | (1u << LCD_PIN_B)); /* both released */
+
+    LCD_DelayMs(50u);                           /* LCD power-up time */
+    g_lcd_addr = LCD_Detect();
+    if (g_lcd_addr == 0u) return;               /* no LCD: stay a no-op */
+
+    /* HD44780 reset sequence, ending in 4-bit mode */
+    LCD_InitNibble(0x3u);   LCD_DelayMs(5u);
+    LCD_InitNibble(0x3u);   LCD_DelayMs(5u);
+    LCD_InitNibble(0x3u);   LCD_DelayMs(1u);
+    LCD_InitNibble(0x2u);   LCD_DelayMs(1u);
+
+    LCD_Command(0x28u);     /* 4-bit bus, 2 rows, 5x8 font */
+    LCD_Command(0x0Cu);     /* display on, cursor off      */
+    LCD_Command(0x06u);     /* cursor moves right          */
+    LCD_Command(0x01u);     /* clear                       */
+    LCD_DelayMs(5u);
 #endif
 }
 
+/* Show two rows of up to 16 characters. Blocks for roughly 0.1 s. */
 static void LCD_Show(const char *line1, const char *line2)
 {
 #if (USE_LCD == 1)
-    /* TODO: set cursor to 0,0 write line1; cursor to 0,1 write line2 */
-    (void)line1; (void)line2;
+    if (g_lcd_addr == 0u) return;
+    LCD_WriteLine(0x80u, line1);                /* row 0 = DDRAM 0x00 */
+    LCD_WriteLine(0xC0u, line2);                /* row 1 = DDRAM 0x40 */
 #else
     (void)line1; (void)line2;
+#endif
+}
+
+/* Show the LCD_Detect() result on the 7-segment display for 1.5 s:
+ * "L 27" / "L 3F" = address that answered, "L --" = no LCD found.
+ * Needs the PIT tick, so main() calls it after System_Init(). */
+static void LCD_BootReport(void)
+{
+#if (USE_LCD == 1)
+    static const uint8_t SEG_HEX[16] = {
+        0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8,
+        0x80, 0x90, 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
+    };
+    uint32_t t0;
+
+    if (g_lcd_addr != 0u) {
+        SevenSeg_SetRaw(SEG_L, SEG_BLANK,
+                        SEG_HEX[g_lcd_addr >> 4], SEG_HEX[g_lcd_addr & 0x0Fu]);
+    } else {
+        SevenSeg_SetRaw(SEG_L, SEG_BLANK, SEG_DASH, SEG_DASH);
+    }
+
+    t0 = g_tick_ms;
+    while ((g_tick_ms - t0) < 1500u) { }
 #endif
 }
 
@@ -544,7 +799,7 @@ void PIT1_IRQHandler(void)
     }
 }
 
-/* One vector serves S1, S2, S3 and the PIR sensor. The source is identified
+/* Switches S1, S2 and S3 share the PORTB vector. The source is identified
  * from the interrupt status flag register. */
 void PORTB_IRQHandler(void)
 {
@@ -567,10 +822,10 @@ void PORTB_IRQHandler(void)
 }
 
 #if (PIR_USE_HARDWARE == 1)
-/* The PIR sits on PTC2, so it has its own port vector. PTC3 and PTC12 belong
- * to the 7-segment driver but keep IRQC = 0, so they never reach this
- * handler. The flag is cleared first, then PDIR confirms the line really is
- * high before a motion event is recorded. */
+/* The PIR sits on PTC2, so it has its own port vector. PTC3, PTC12, PTC16
+ * and PTC17 belong to the 7-segment and LCD drivers but keep IRQC = 0, so
+ * they never reach this handler. The flag is cleared first, then PDIR
+ * confirms the line really is high before a motion event is recorded. */
 void PORTC_IRQHandler(void)
 {
     uint32_t flags = PORTC->ISFR;
@@ -743,6 +998,9 @@ static void State_Armed(void)
     if (LED_BlinkPhase(2000u)) LED_On(2); else LED_Off(2);
 
 #if (PIR_USE_HARDWARE == 1)
+    /* LED4 mirrors the raw PIR output so the sensor can be watched live. */
+    if (PTC->PDIR & (1u << PIR_PIN)) LED_On(4); else LED_Off(4);
+
     /* After the exit walk the PIR usually still holds its output high, and
      * it keeps it there for as long as its Tx pot is set to. A rising edge
      * can only arrive once the line has fallen again, so the sensor is
@@ -860,6 +1118,7 @@ static void System_Init(void)
 int main(void)
 {
     System_Init();
+    LCD_BootReport();       /* 1.5 s: shows whether the LCD answered */
     App_EnterState(ST_DISARMED);
 
     for (;;) {
